@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
 Dorking Quack - SAFE multi-threaded SerpAPI dork runner
-CLEAN OUTPUT VERSION (SerpAPI prints removed)
-
-Changes:
- - Removed SerpAPI/Quota prints
- - Nice -h help menu added
- - Final output only shows total URL count
+MULTI-DOMAIN VERSION
 """
 
 import argparse
@@ -129,7 +124,7 @@ def sanitize(dork: str, domain: str) -> str:
     return dork.replace("example.com", domain).replace("example[.]com", domain)
 
 
-def process_dork(category, dork, domain, api_key, pages, delay):
+def process_dork(domain, category, dork, api_key, pages, delay):
     q = sanitize(dork, domain)
     found = set()
     for p in range(pages):
@@ -147,105 +142,95 @@ def process_dork(category, dork, domain, api_key, pages, delay):
                 else:
                     time.sleep(BACKOFF ** attempt)
         time.sleep(delay)
-    return category, dork, found
+    return domain, category, dork, found
 
 
 def main():
-    print("Dorking Quack 🦆\n")
+    print("Dorking Quack 🦆 (Multi-domain)\n")
 
     parser = argparse.ArgumentParser(
-        description="Dorking Quack 🦆 — A safe, multi-threaded Google dork runner using SerpAPI.",
-        epilog="""
-Examples:
-  python3 dorking_quack.py --domain example.com --dorks dorks.txt --apikey YOUR_API_KEY
-
-Optional:
-  python3 dorking_quack.py --domain example.com --dorks dorks.txt --apikey KEY --pages 3 --threads 12 --csv
-
-Output:
- - Per-category URLs saved in output/<category>/urls.txt
- - Combined results saved in output/all_urls.txt
-""",
+        description="Multi-domain Google dork scanner using SerpAPI.",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    parser.add_argument("--domain", required=True, help="Target domain to replace example.com inside dorks")
+    parser.add_argument("--domains", required=True,
+                        help="Comma-separated list of target domains")
     parser.add_argument("--dorks", required=True, help="Path to categorized dorks file")
-    parser.add_argument("--apikey", required=True, help="Your SerpAPI key")
-    parser.add_argument("--pages", type=int, default=2, help="Pages per dork (default=2)")
-    parser.add_argument("--threads", type=int, default=8, help="Max parallel threads (default=8)")
-    parser.add_argument("--delay", type=float, default=0.8, help="Delay between API calls (default=0.8s)")
-    parser.add_argument("--csv", action="store_true", help="Save results as CSV per category")
+    parser.add_argument("--apikey", required=True)
+    parser.add_argument("--pages", type=int, default=2)
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--delay", type=float, default=0.8)
+    parser.add_argument("--csv", action="store_true")
 
     args = parser.parse_args()
 
-    used_before = load_usage()
-    quota = MONTHLY_QUOTA
+    domains = [x.strip() for x in args.domains.split(",") if x.strip()]
 
     categories = load_categorized_dorks(args.dorks)
-    tasks = [(c, d) for c in categories for d in categories[c]]
+
+    tasks = []
+    for domain in domains:
+        for c in categories:
+            for d in categories[c]:
+                tasks.append((domain, c, d))
+
     total_dorks = len(tasks)
 
-    credits_needed = total_dorks * args.pages
-    after = used_before + credits_needed
-
-    y = input("Proceed with scan? (Y/n): ").lower().strip()
+    y = input(f"Run scan for {len(domains)} domains? (Y/n): ").lower()
     if y not in ("", "y", "yes"):
         print("Aborted.")
         return
 
-    threads = min(args.threads, total_dorks)
-
-    ensure_dir("output")
-    for c in categories:
-        ensure_dir(f"output/{c}")
-
-    lock = threading.Lock()
-    all_urls = set()
-    spinner = Spinner("Searching")
+    spinner = Spinner("Scanning")
     spinner.start()
 
+    ensure_dir("output")
+
+    lock = threading.Lock()
+    domain_urls = {d: set() for d in domains}
+
     futures = []
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        for (c, d) in tasks:
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        for (domain, c, dork_text) in tasks:
             futures.append(ex.submit(
-                process_dork, c, d, args.domain, args.apikey, args.pages, args.delay
+                process_dork, domain, c, dork_text,
+                args.apikey, args.pages, args.delay
             ))
 
         done = 0
         for f in as_completed(futures):
             done += 1
-            category, dork_text, urls = f.result()
+            domain, category, dork_text, urls = f.result()
 
-            out = f"output/{category}/urls.txt"
+            outdir = f"output/{domain}/{category}"
+            ensure_dir(outdir)
+
+            out_file = f"{outdir}/urls.txt"
             old = set()
-            if os.path.exists(out):
-                old = {x.strip() for x in open(out).read().splitlines()}
+            if os.path.exists(out_file):
+                old = {x.strip() for x in open(out_file).read().splitlines()}
+
             new = sorted(set(urls) - old)
-            with open(out, "a") as fw:
-                for u in new:
-                    fw.write(u + "\n")
+            with open(out_file, "a") as fw:
+                fw.writelines([u + "\n" for u in new])
 
             if args.csv:
-                with open(f"output/{category}/results.csv", "a") as fw:
+                with open(f"{outdir}/results.csv", "a") as fw:
                     for u in new:
                         safe = dork_text.replace('"', "'")
                         fw.write(f'"{category}","{safe}","{u}"\n')
 
             with lock:
-                all_urls.update(urls)
-                with open("output/all_urls.txt", "w") as fw:
-                    for u in sorted(all_urls):
-                        fw.write(u + "\n")
+                domain_urls[domain].update(urls)
 
-            print(f"\rProcessed {done}/{total_dorks} dorks", end="")
+            print(f"\rProcessed {done}/{total_dorks}", end="")
 
     spinner.stop()
 
-    print("\n\n[✓] Scan Complete!")
-    print(f"[✓] Total URLs found: {len(all_urls)}")
+    print("\n\n[✓] Finished.")
 
-    save_usage(after)
+    for domain in domains:
+        print(f"[{domain}] URLs found: {len(domain_urls[domain])}")
 
 
 if __name__ == "__main__":
